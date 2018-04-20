@@ -1,5 +1,6 @@
 from __future__ import absolute_import, unicode_literals
 
+import importlib
 from collections import OrderedDict
 from contextlib import contextmanager
 from os.path import normpath
@@ -11,10 +12,10 @@ from django.core import signing
 from django.db.models.query import QuerySet, RawQuerySet
 from django.template import RequestContext, Template
 from django.test.signals import template_rendered
-from django.test.utils import instrumented_test_render
 from django.utils import six
 from django.utils.encoding import force_text
 from django.utils.translation import ugettext_lazy as _
+from django.conf import settings
 
 from debug_toolbar.panels import Panel
 from debug_toolbar.panels.sql.tracking import SQLQueryTriggered, recording
@@ -26,10 +27,26 @@ from debug_toolbar.panels.templates import views
 # Code taken and adapted from Simon Willison and Django Snippets:
 # https://www.djangosnippets.org/snippets/766/
 
-if Template._render != instrumented_test_render:
-    Template.original_render = Template._render
-    Template._render = instrumented_test_render
 
+def instrumented_test_render(self, context=None, request=None):
+    template_rendered.send(sender=self, template=self, context=context)
+    return self.original_render(context=context, request=request)
+
+
+def patch_template_backends(template_backends):
+    for template in template_backends:
+        backend = template['BACKEND']
+        module_name, _ = backend.rsplit('.', 1)
+        print(module_name)
+        module = importlib.import_module(module_name)
+        print(module)
+
+        if module.Template.render != instrumented_test_render:
+            module.Template.original_render = module.Template.render
+            module.Template.render = instrumented_test_render
+
+
+patch_template_backends(settings.TEMPLATES)
 
 # Monkey-patch to store items added by template context processors. The
 # overhead is sufficiently small to justify enabling it unconditionally.
@@ -85,14 +102,20 @@ class TemplatesPanel(Panel):
         template, context = kwargs['template'], kwargs['context']
 
         # Skip templates that we are generating through the debug toolbar.
-        if (isinstance(template.name, six.string_types) and (
-            template.name.startswith('debug_toolbar/') or
-            template.name.startswith(
-                tuple(self.toolbar.config['SKIP_TEMPLATE_PREFIXES'])))):
+        name = getattr(template.template, 'name', None)
+        if (isinstance(name, six.string_types) and (
+            name.startswith('debug_toolbar/') or
+            any(name.startswith(prefix) for prefix
+                in self.toolbar.config['SKIP_TEMPLATE_PREFIXES']))):
             return
 
         context_list = []
-        for context_layer in context.dicts:
+        if hasattr(context, 'dicts'):
+            context_layers = context.dicts
+        else:
+            context_layers = [context]
+
+        for context_layer in context_layers:
             if hasattr(context_layer, 'items') and context_layer:
                 # Refs GitHub issue #910
                 # If we can find this layer in our pseudo-cache then find the
@@ -168,7 +191,7 @@ class TemplatesPanel(Panel):
     @property
     def nav_subtitle(self):
         if self.templates:
-            return self.templates[0]['template'].name
+            return self.templates[0]['template'].template.name
         return ''
 
     template = 'debug_toolbar/panels/templates.html'
